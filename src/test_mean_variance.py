@@ -2,12 +2,17 @@
 
 import numpy as np
 
+import pytest
+
 from mean_variance import (
     efficient_weights,
     frontier,
+    frontier_constants,
     frontier_variance,
     max_sharpe_weights,
     minimize_variance,
+    minimize_variance_with_risk_free,
+    risk_free_frontier,
 )
 
 MU = np.array([0.04, 0.08, 0.12])
@@ -57,3 +62,99 @@ def test_max_sharpe_matches_the_tangency_formula():
     w_formula = w_formula / w_formula.sum()
     w_numerical = max_sharpe_weights(MU, SIGMA, RF, allow_short=True)
     assert np.allclose(w_formula, w_numerical, atol=1e-5)
+
+
+def test_no_short_max_sharpe_needs_an_asset_that_beats_the_risk_free_rate():
+    with pytest.raises(RuntimeError):
+        max_sharpe_weights(MU, SIGMA, rf=0.20, allow_short=False)
+    # One asset beats the risk-free rate, so the answer is that asset alone.
+    w = max_sharpe_weights(MU, SIGMA, rf=0.11, allow_short=False)
+    assert np.allclose(w, [0, 0, 1], atol=1e-6)
+
+
+def test_risk_free_frontier_is_tangent_to_the_risky_frontier():
+    z, H, arbitrage = risk_free_frontier(MU, SIGMA, RF)
+    assert not arbitrage
+    assert np.allclose(z, np.linalg.solve(SIGMA, MU - RF))
+    # The tangency portfolio is on the risky frontier and earns the highest Sharpe ratio.
+    w = z / z.sum()
+    assert np.isclose(w @ SIGMA @ w, frontier_variance(MU, SIGMA, w @ MU))
+    assert np.isclose((w @ MU - RF) / np.sqrt(w @ SIGMA @ w), np.sqrt(H))
+
+
+def test_no_portfolio_of_risky_assets_beats_the_risk_free_frontier():
+    # Below, at, and above the mean of the minimum variance portfolio.
+    A, B, _, _ = frontier_constants(MU, SIGMA)
+    targets = np.linspace(-0.5, 0.5, 400)
+    vols = np.sqrt(frontier_variance(MU, SIGMA, targets))
+    for rf in [0.02, B / A, 0.10]:
+        _, H, _ = risk_free_frontier(MU, SIGMA, rf)
+        assert np.all(np.abs(targets - rf) / vols <= np.sqrt(H) + 1e-12)
+
+
+def test_risk_free_rate_at_the_minimum_variance_mean_leaves_no_tangency_portfolio():
+    A, B, _, D = frontier_constants(MU, SIGMA)
+    z, H, _ = risk_free_frontier(MU, SIGMA, B / A)
+    assert np.isclose(z.sum(), 0)  # the risky position costs nothing
+    assert np.isclose(H, D / A)  # the frontier lines are the asymptotes
+
+
+def test_singular_covariance_is_an_arbitrage_unless_the_riskless_mix_earns_rf():
+    # Two perfectly negatively correlated assets. Weights of 2/3 and 1/3 have no risk.
+    mu = np.array([0.06, 0.12])
+    Sigma = np.array([[0.01, -0.02], [-0.02, 0.04]])
+    riskless_return = 2 / 3 * 0.06 + 1 / 3 * 0.12
+    assert risk_free_frontier(mu, Sigma, rf=0.02)[2]
+    assert not risk_free_frontier(mu, Sigma, rf=riskless_return)[2]
+    # The same asset twice is singular too, but there is nothing to arbitrage.
+    z, H, arbitrage = risk_free_frontier(np.array([0.08, 0.08]), np.full((2, 2), 0.04), rf=0.02)
+    assert not arbitrage
+    assert np.isclose(H, (0.08 - 0.02) ** 2 / 0.04)
+
+
+def test_numerical_solver_matches_closed_form_with_a_risk_free_asset():
+    z, H, _ = risk_free_frontier(MU, SIGMA, RF)
+    for target in [-0.05, 0.02, 0.06, 0.30]:
+        w = minimize_variance_with_risk_free(MU, SIGMA, RF, target)
+        assert np.allclose(w, (target - RF) / H * z, atol=1e-6)
+
+
+def test_no_short_frontier_with_borrowing_is_a_line_through_the_no_short_tangency():
+    rf = 0.07  # asset 1 has a mean below rf, so its no-short weight is zero
+    w_tan = max_sharpe_weights(MU, SIGMA, rf, allow_short=False)
+    sharpe = (w_tan @ MU - rf) / np.sqrt(w_tan @ SIGMA @ w_tan)
+    for target in [0.08, 0.15, 0.40]:
+        w = minimize_variance_with_risk_free(MU, SIGMA, rf, target, allow_short=False)
+        assert w.min() >= -1e-8
+        assert np.isclose((target - rf) / np.sqrt(w @ SIGMA @ w), sharpe, atol=1e-6)
+
+
+def test_no_borrowing_puts_the_frontier_back_on_the_risky_frontier():
+    w_tan = np.linalg.solve(SIGMA, MU - RF)
+    w_tan = w_tan / w_tan.sum()
+    # Below the tangency mean the constraint does not bind: lend and hold the tangency.
+    target = (RF + w_tan @ MU) / 2
+    w = minimize_variance_with_risk_free(MU, SIGMA, RF, target, allow_borrowing=False)
+    assert np.allclose(w, w_tan / 2, atol=1e-6)
+    # Above it, borrowing is needed and not allowed, so all wealth goes in risky assets.
+    target = w_tan @ MU + 0.03
+    w = minimize_variance_with_risk_free(MU, SIGMA, RF, target, allow_borrowing=False)
+    assert np.isclose(w.sum(), 1, atol=1e-6)
+    assert np.isclose(w @ SIGMA @ w, frontier_variance(MU, SIGMA, target), atol=1e-8)
+
+
+def test_targets_that_the_constraints_rule_out_raise():
+    # No asset beats a 20% risk-free rate, so without shorts nothing can earn more than it.
+    with pytest.raises(RuntimeError):
+        minimize_variance_with_risk_free(MU, SIGMA, 0.20, 0.25, allow_short=False)
+    # Without shorts or borrowing, nothing earns more than the best asset.
+    with pytest.raises(RuntimeError):
+        minimize_variance_with_risk_free(
+            MU, SIGMA, RF, 0.13, allow_short=False, allow_borrowing=False
+        )
+    # The best asset itself is still within reach, and so is the risk-free asset.
+    w = minimize_variance_with_risk_free(
+        MU, SIGMA, RF, 0.12, allow_short=False, allow_borrowing=False
+    )
+    assert np.allclose(w, [0, 0, 1], atol=1e-6)
+    assert np.allclose(minimize_variance_with_risk_free(MU, SIGMA, RF, RF), 0)
